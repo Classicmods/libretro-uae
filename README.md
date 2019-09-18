@@ -13,9 +13,9 @@ author of the x86 JIT compiler), Toni Wilen (the current maintainer of
 WinUAE), and many more.
 
 This RETRO port was  based at start on PS3 version E-UAE 0.8.29-WIP4 release 8
-(so aslo credits to Ole.)
+(so also credits to Ole.)
 
-For now we use the UAE core provided by P-UAE 2.6.1 :
+For now we use the UAE core provided by P-UAE 2.6.1:
 Git Commit: 0186c1b16f7181ffa02d73e6920d3180ce457c46
 https://github.com/GnoStiC/PUAE 
 
@@ -51,11 +51,12 @@ The following models are provided (hardcoded configuration):
 
 |Model|Description|
 |---|---|
-|A500|Simulate an Amiga 500 with OCS chipset, 0.5MB of RAM and 0.5MB of slow memory expansion.|
-|A500OG|Simulate an Amiga 500 with OCS chipset, 0.5MB of RAM.|
-|A500+|Simulate an Amiga 500+ with ECS chipset, 1MB of RAM and 1MB of slow memory expansion.|
-|A600|Simulate an Amiga 600 with ECS chipset, 2MB of RAM and 8MB of fast memory expansion.|
-|A1200|Simulate an Amiga 1200 with AGA chipset, 2MB of RAM and 8MB of fast memory expansion.|
+|A500|Amiga 500 with OCS chipset, 0.5MB of RAM and 0.5MB of slow memory expansion|
+|A500OG|Amiga 500 with OCS chipset, 0.5MB of RAM|
+|A500+|Amiga 500+ with ECS chipset, 1MB of RAM and 1MB of slow memory expansion|
+|A600|Amiga 600 with ECS chipset, 2MB of RAM and 8MB of fast memory expansion|
+|A1200|Amiga 1200 with AGA chipset, 2MB of RAM and 8MB of fast memory expansion|
+|A1200OG|Amiga 1200 with AGA chipset, 2MB of RAM|
 
 As the configuration file is only generated when launching a game you must restart RetroArch for the changes to take effects.
 
@@ -143,6 +144,10 @@ To do this just add these strings to your adf, hdf or m3u filename:
 - "(A500+)" or "(A500PLUS)" to use Amiga 500+
 - "(A600)" or "(ECS)" to use Amiga 600
 - "(A1200)" or "(AGA)" to use Amiga 1200
+- "(A1200OG)" or "(A1200NF)" to use Amiga 1200 without memory expansion
+- "(NTSC)" to use NTSC
+- "(PAL)" to use PAL
+- "(MD)" to insert each disk in different drive (Maximum 4 disks)
 
 Example: When launching "Alien Breed 2 (AGA).hdf" file the core will use an Amiga 1200 model.
 
@@ -167,7 +172,7 @@ Three parameters control the output resolution of the core :
 |Name|Values|Default|
 |---|---|---|
 |Video standard|PAL, NTSC|PAL|
-|High resolution|false, true|false|
+|High resolution|false, true|true|
 |Crop overscan|false, true|false|
 
 With this settings all the standards resolutions of the amiga are available :
@@ -191,9 +196,16 @@ Look at the sample configuration file "RickDangerous.uae" for help. You can use 
 
 You can find the whole documentation in [configuration.txt](configuration.txt).
 
-## Knows Bugs
-- When load savesate, exiting GUI without reset. You have to re-enter GUI and do the reset.
-- It's a debug release, so expect bug.
+Example 1: You want to mount four non-rdb .hdf files. You have one bootable 1000 MB file called `System.hdf` created with surfaces=1, and three non-bootable 2000 MB files called `WHDGamesA.hdf`, `WHDGamesB.hdf`, `WHDGamesC.hdf` created with surfaces=2. Your hdf files are located in the folder with absolute path `/emuroms/amiga/hdf/`. For that scenario, you should create a .uae text file with the following content:
+```
+hardfile=read-write,32,1,2,512,/emuroms/amiga/hdf/System.hdf
+hardfile=read-write,32,2,2,512,/emuroms/amiga/hdf/WHDGamesA.hdf
+hardfile=read-write,32,2,2,512,/emuroms/amiga/hdf/WHDGamesB.hdf
+hardfile=read-write,32,2,2,512,/emuroms/amiga/hdf/WHDGamesC.hdf
+```
+You can then load your .uae file via Load Content.
 
+Note that for most hdf files, the model has to be set to A1200 in Quickmenu->Options. This requires a restart to take effect.
 
-We plan to use the core of WinUAE in the future, but no release date for now.
+If you are using rdb hdf files, please use 0,0,0,0 instead of geometry numbers like 32,1,2,512. The geometry will then be read from the file. This only works for rdb hdf files.
+

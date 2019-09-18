@@ -27,16 +27,15 @@ void inputdevice_release_all_keys (void);
 #include "libretro-mapper.h"
 extern unsigned int uae_devices[4];
 extern unsigned int inputdevice_finalized;
-
-#define PIX_BYTES 2
+extern int pix_bytes;
 
 #define TD_POSY 30
 
 #define LOG_MSG(...) 
 #define LOG_MSG2(...) 
 
-extern int retrow; 
-extern int retroh;
+extern int defaultw;
+extern int defaulth;
 
 unsigned short int clut[] = {
 	0x0000,  /* full background transparency */
@@ -48,21 +47,14 @@ unsigned short int clut[] = {
 unsigned short int* pixbuf = NULL;
 
 extern unsigned short int  bmp[1024*1024];
-extern short signed int SNDBUF[1024*2];
-extern int  sndbufpos;
 void retro_audio_cb(short l, short r);
 
-void pause_select(void);
-int pause_emulation;
 int prefs_changed = 0;
-
 int vsync_enabled = 0;
 //int stat_count;
 int opt_scrw = 0;
 int opt_scrh = 0;
 unsigned long stat_value = 0;
-
-int opt_scanline = 0;
 
 void gui_init (int argc, char **argv)
 {
@@ -89,17 +81,20 @@ void target_default_options (struct uae_prefs *p, int type)
 
 void retro_mouse(int dx, int dy)
 {
+   changed_prefs.jports[0].id = JSEM_MICE;
 	setmousestate (0, 0, dx, 0);
-    setmousestate (0, 1, dy, 0);	
+    setmousestate (0, 1, dy, 0);
 }
 
 void retro_mouse_but0(int down)
 {
+   changed_prefs.jports[0].id = JSEM_MICE;
 	setmousebuttonstate (0, 0, down);
 }
 
 void retro_mouse_but1(int down)
 {
+   changed_prefs.jports[0].id = JSEM_MICE;
 	setmousebuttonstate (0, 1, down);
 }
 
@@ -275,14 +270,11 @@ void retro_key_up(int key)
 	inputdevice_do_keyboard (key, 0);
 }
 
-extern int pauseg;
-int RLOOP=1;
-
 int retro_renderSound(short* samples, int sampleCount)
 {
    int i; 
 
-   if (sampleCount < 1 || pauseg==1)
+   if (sampleCount < 1)
       return 0;
 
    for(i=0;i<sampleCount;i+=2)
@@ -291,24 +283,12 @@ int retro_renderSound(short* samples, int sampleCount)
    }
 }
 
-void InitOSGLU(void)
-{
-
-}
-
-void  UnInitOSGLU(void)
-{
-
-}
-
 void ScreenUpdate ()
 {
 }
 
 void retro_flush_screen (struct vidbuf_description *gfxinfo, int ystart, int yend)
 {
-	if(pauseg==1)
-      pause_select();
 	co_switch(mainThread);
 }
 
@@ -338,43 +318,42 @@ int graphics_init(void) {
 	if (pixbuf != NULL) {
 		return 1;
 	}
-	currprefs.gfx_size_win.width=retrow;
+	currprefs.gfx_size_win.width = defaultw;
 
 #ifdef ENABLE_LOG_SCREEN
 	currprefs.gfx_height = 256;
 	currprefs.gfx_linedbl = 0;	//disable line doubling
 #else
-	currprefs.gfx_size_win.height= retroh;
+	currprefs.gfx_size_win.height = defaulth;
 #endif	
 	opt_scrw = currprefs.gfx_size_win.width;
 	opt_scrh = currprefs.gfx_size_win.height;
 
-	if (currprefs.gfx_size_win.width>= 640) {
+	//if (currprefs.gfx_size_win.width>= 640) {
 	//currprefs.gfx_lores = 0;
-	} else {
+	//} else {
 	//	currprefs.gfx_lores = 1;
-	}
+	//}
 	//vsync_enabled = currprefs.gfx_vsync;
 	LOG_MSG2("screen w=%i", currprefs.gfx_size_win.width);
 	LOG_MSG2("screen h=%i", currprefs.gfx_size_win.height);
 
 #ifdef ENABLE_LOG_SCREEN
-	pixbuf = (unsigned int*) malloc(currprefs.gfx_size_win.width * 576 * PIX_BYTES);
+	pixbuf = (unsigned int*) malloc(currprefs.gfx_size_win.width * 576 * pix_bytes);
 #else
 	pixbuf = (unsigned short int*) &bmp[0];
 #endif
-	
-	//printf("graphics init  pixbuf=%p color_mode=%d width=%d\n", pixbuf, currprefs.color_mode, currprefs.gfx_width_win);
+	//printf("graphics init: pixbuf=%p color_mode=%d width=%d height=%d\n", pixbuf, currprefs.color_mode, currprefs.gfx_size_win.width, currprefs.gfx_size_win.height);
 	if (pixbuf == NULL) {
 		printf("Error: not enough memory to initialize screen buffer!\n");
 		return -1;
 	}
-	memset(pixbuf, 0x80, currprefs.gfx_size_win.width * currprefs.gfx_size_win.height * PIX_BYTES);
+	//memset(pixbuf, 0x80, currprefs.gfx_size_win.width * currprefs.gfx_size_win.height * pix_bytes);
 
 	gfxvidinfo.width_allocated = currprefs.gfx_size_win.width;
 	gfxvidinfo.height_allocated = currprefs.gfx_size_win.height;
 	gfxvidinfo.maxblocklines = 1000;
-	gfxvidinfo.pixbytes = PIX_BYTES;
+	gfxvidinfo.pixbytes = pix_bytes;
 	gfxvidinfo.rowbytes = gfxvidinfo.width_allocated * gfxvidinfo.pixbytes ;
 	gfxvidinfo.bufmem = (unsigned char*)pixbuf;
 	gfxvidinfo.emergmem = 0;
@@ -393,7 +372,6 @@ int graphics_init(void) {
     reset_drawing ();
 	return 1;
 }
-
 
 int is_fullscreen (void)
 {
@@ -414,7 +392,10 @@ int mousehack_allowed (void)
 int graphics_setup(void) {
 	//32bit mode
 	//Rw, Gw, Bw,   Rs, Gs, Bs,   Aw, As, Avalue, swap
-	alloc_colors64k (5, 6, 5, 11, 5, 0, 0, 0, 0, 0); 
+	if (pix_bytes == 2)
+		alloc_colors64k (5, 6, 5, 11, 5, 0, 0, 0, 0, 0); 
+	else
+		alloc_colors64k (8, 8, 8, 16, 8, 0, 0, 0, 0, 0);
 
 	return 1;
 }
@@ -448,20 +429,36 @@ void toggle_fullscreen(int mode) {
 }
 
 int check_prefs_changed_gfx (void) {
-	if (prefs_changed) {
-		prefs_changed = 0;
-		return 1;
-	}
-	return 0;
+    if (prefs_changed)
+        prefs_changed = 0;
+    else
+        return 0;
+
+    changed_prefs.gfx_size_win.width = defaultw;
+    changed_prefs.gfx_size_win.height = defaulth;
+
+    currprefs.gfx_size_win.width    = changed_prefs.gfx_size_win.width;
+    currprefs.gfx_size_win.height   = changed_prefs.gfx_size_win.height;
+    currprefs.gfx_xcenter           = changed_prefs.gfx_xcenter;
+    currprefs.gfx_ycenter           = changed_prefs.gfx_ycenter;
+
+    gfxvidinfo.width_allocated      = currprefs.gfx_size_win.width;
+    gfxvidinfo.height_allocated     = currprefs.gfx_size_win.height;
+
+    reset_drawing();
+    //printf("check_prefs_changed_gfx: %d:%d, xcenter:%d ycenter:%d\n", changed_prefs.gfx_size_win.width, changed_prefs.gfx_size_win.height, changed_prefs.gfx_xcenter, changed_prefs.gfx_ycenter);
+    return 0;
 }
 
 void clean_led_area(void) {
-	int size = 11 * opt_scrw * gfxvidinfo.pixbytes;
-	unsigned short int* addr;
+/*
+    int size = 11 * opt_scrw * gfxvidinfo.pixbytes;
+    unsigned short int* addr;
 
-	addr = pixbuf;
-	addr+= (opt_scrh-11-TD_POSY)* opt_scrw;
-	memset(addr, 0, size);
+    addr = pixbuf;
+    addr+= (opt_scrh-11-TD_POSY)* opt_scrw;
+    memset(addr, 0, size);
+*/
 }
 
 

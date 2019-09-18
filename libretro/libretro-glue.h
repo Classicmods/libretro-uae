@@ -1,5 +1,5 @@
-#ifndef LIBRETRO_HATARI_H
-#define LIBRETRO_HATARI_H
+#ifndef LIBRETRO_GLUE_H
+#define LIBRETRO_GLUE_H
 
 #include <stdint.h>
 #include <string.h>
@@ -18,6 +18,7 @@
 extern cothread_t mainThread;
 extern cothread_t emuThread;
 
+bool retro_update_av_info(bool, bool, bool);
 
 #define LOGI printf
 
@@ -26,25 +27,15 @@ extern cothread_t emuThread;
 
 extern int retrow; 
 extern int retroh;
-extern int CROP_WIDTH;
-extern int CROP_HEIGHT;
+extern int opt_vertical_offset;
+extern bool fast_forward_is_on;
 
 #define NPLGN 11
 #define NLIGN 7
 #define NLETT 9
 
-#define XPADDING 20
-#define YDELTA 110
-
-#define XBASE0 4+(XPADDING/2)
-#define YBASE0 (CROP_HEIGHT - NLIGN*YSIDE) -60
-#define YBASE0A YBASE0 + YDELTA
-
-#define XBASE3 (XPADDING/2)
-#define YBASE3 YBASE0 -4
-#define YBASE3A YBASE3 + YDELTA
-
 #define RGB565(r, g, b)  (((r) << (5+6)) | ((g) << 6) | (b))
+#define RGB888(r, g, b)  (((r) << (16)) | ((g) << 8) | (b))
 
 #ifndef _WIN32
 #define TCHAR char /* from sysdeps.h */

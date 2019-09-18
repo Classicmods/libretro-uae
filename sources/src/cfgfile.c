@@ -4616,7 +4616,7 @@ uae_u8 *save_configuration (int *len, bool fullconfig)
 			char *out;
 			if (!fullconfig && !_tcsncmp (tmpout, _T("input."), 6))
 				continue;
-			write_log (_T("'%s'\n"), tmpout);
+			//write_log (_T("'%s'\n"), tmpout);
 			out = uutf8 (tmpout);
 			strcpy ((char*)p, out);
 			xfree (out);
@@ -4705,7 +4705,11 @@ void default_prefs (struct uae_prefs *p, int type)
 	p->sound_interpol = 1;
 	p->sound_filter = FILTER_SOUND_EMUL;
 	p->sound_filter_type = 0;
+#ifdef __LIBRETRO__
+	p->sound_auto = 0;
+#else
 	p->sound_auto = 1;
+#endif
 	p->sampler_stereo = false;
 	p->sampler_buffer = 0;
 	p->sampler_freq = 0;
@@ -4791,7 +4795,11 @@ void default_prefs (struct uae_prefs *p, int type)
 	p->immediate_blits = 0;
 	p->waiting_blits = 0;
 	p->collision_level = 2;
+#ifdef __LIBRETRO__
+	p->leds_on_screen = 1;
+#else
 	p->leds_on_screen = 0;
+#endif
 	p->leds_on_screen_mask[0] = p->leds_on_screen_mask[1] = (1 << LED_MAX) - 1;
 	p->keyboard_leds_in_use = 0;
 	p->keyboard_leds[0] = p->keyboard_leds[1] = p->keyboard_leds[2] = 0;
@@ -4905,7 +4913,11 @@ void default_prefs (struct uae_prefs *p, int type)
 	p->z3fastmem2_size = 0x00000000;
 	p->z3fastmem_start = 0x10000000;
 	p->chipmem_size = 0x00080000;
+#ifdef __LIBRETRO__
+	p->bogomem_size = 0x00000000;
+#else
 	p->bogomem_size = 0x00080000;
+#endif
 	p->rtgmem_size = 0x00000000;
 	p->rtgmem_type = 1;
 	p->custom_memory_addrs[0] = 0;
@@ -4914,10 +4926,18 @@ void default_prefs (struct uae_prefs *p, int type)
 	p->custom_memory_sizes[1] = 0;
 	p->fastmem_autoconfig = true;
 
+#ifdef __LIBRETRO__
 	p->nr_floppies = 1;
+#else
+	p->nr_floppies = 2;
+#endif
 	p->floppy_read_only = false;
 	p->floppyslots[0].dfxtype = DRV_35_DD;
+#ifdef __LIBRETRO__
 	p->floppyslots[1].dfxtype = DRV_NONE;
+#else
+	p->floppyslots[1].dfxtype = DRV_35_DD;
+#endif
 	p->floppyslots[2].dfxtype = DRV_NONE;
 	p->floppyslots[3].dfxtype = DRV_NONE;
 	p->floppy_speed = 100;

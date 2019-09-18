@@ -1,6 +1,4 @@
 #include "libretro.h"
-#include "gui-retro/dialog.h"
-#include "gui-retro/file.h"
 #include "retrodep/retroglue.h"
 #include "libretro-mapper.h"
 #include "libretro-glue.h"
@@ -13,9 +11,10 @@
 #include "uae.h"
 #include "options.h"
 #include "inputdevice.h"
+#include "savestate.h"
 
-#define EMULATOR_DEF_WIDTH 640
-#define EMULATOR_DEF_HEIGHT 400
+#define EMULATOR_DEF_WIDTH 720
+#define EMULATOR_DEF_HEIGHT 568
 #define EMULATOR_MAX_WIDTH 1024
 #define EMULATOR_MAX_HEIGHT 1024
 
@@ -30,9 +29,6 @@ int defaultw = EMULATOR_DEF_WIDTH;
 int defaulth = EMULATOR_DEF_HEIGHT;
 int retrow = 0;
 int retroh = 0;
-int CROP_WIDTH;
-int CROP_HEIGHT;
-int sndbufpos=0;
 char key_state[512];
 char key_state2[512];
 bool opt_use_whdload_hdf = true;
@@ -45,9 +41,14 @@ int analog_deadzone = 6144;
 unsigned int analog_sensitivity = 2048;
 extern int turbo_fire_button;
 extern unsigned int turbo_pulse;
-
-static int firstps = 0;
-unsigned int inputdevice_finalized = 0;
+int pix_bytes = 2;
+static bool pix_bytes_initialized = false;
+bool fake_ntsc = false;
+bool real_ntsc = false;
+bool request_update_av_info = false;
+int zoom_mode_id = 0;
+int zoomed_height;
+bool fast_forward_is_on = false;
 
 #if defined(NATMEM_OFFSET)
 extern uae_u8 *natmem_offset;
@@ -55,15 +56,23 @@ extern uae_u32 natmem_size;
 #endif
 extern unsigned short int  bmp[EMULATOR_MAX_WIDTH*EMULATOR_MAX_HEIGHT];
 extern unsigned short int  savebmp[EMULATOR_MAX_WIDTH*EMULATOR_MAX_HEIGHT];
-extern int pauseg;
 extern int SHIFTON;
 extern int STATUSON;
-extern int snd_sampler;
-extern short signed int SNDBUF[1024*2];
 extern char RPATH[512];
 extern void Print_Status(void);
-int ledtype=1;
+extern unsigned short * sndbuffer;
+extern int sndbufsize;
+static int firstpass = 1;
+extern int prefs_changed;
+int opt_vertical_offset = 0;
+extern int minfirstline;
+static int minfirstline_update_frame_timer = 3;
 unsigned int video_config = 0;
+unsigned int video_config_old = 0;
+unsigned int video_config_aspect = 0;
+unsigned int video_config_geometry = 0;
+unsigned int video_config_allow_hz_change = 0;
+unsigned int inputdevice_finalized = 0;
 
 #include "libretro-keyboard.i"
 int keyId(const char *val)
@@ -82,8 +91,14 @@ extern void retro_poll_event(void);
 unsigned int uae_devices[4];
 extern int cd32_pad_enabled[NORMAL_JPORTS];
 
-int mapper_keys[30]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+int mapper_keys[31]={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
 static char buf[64][4096] = { 0 };
+
+#ifdef WIN32
+#define DIR_SEP_STR "\\"
+#else
+#define DIR_SEP_STR "/"
+#endif
 
 static retro_video_refresh_t video_cb;
 static retro_audio_sample_t audio_cb;
@@ -105,31 +120,44 @@ static dc_storage* dc;
 cpu_type=68000\n\
 chipmem_size=1\n\
 bogomem_size=2\n\
+chipset_compatible=A500\n\
 chipset=ocs\n"
 
 #define A500OG "\
 cpu_type=68000\n\
 chipmem_size=1\n\
 bogomem_size=0\n\
+chipset_compatible=A500\n\
 chipset=ocs\n"
 
 #define A500PLUS "\
 cpu_type=68000\n\
 chipmem_size=2\n\
 bogomem_size=4\n\
+chipset_compatible=A500+\n\
 chipset=ecs\n"
 
 #define A600 "\
 cpu_type=68000\n\
 chipmem_size=4\n\
 fastmem_size=8\n\
+chipset_compatible=A600\n\
 chipset=ecs\n"
 
 #define A1200 "\
 cpu_type=68ec020\n\
 chipmem_size=4\n\
 fastmem_size=8\n\
+chipset_compatible=A1200\n\
 chipset=aga\n"
+
+#define A1200OG "\
+cpu_type=68ec020\n\
+chipmem_size=4\n\
+fastmem_size=0\n\
+chipset_compatible=A1200\n\
+chipset=aga\n"
+
 
 // Amiga default kickstarts
 
@@ -201,6 +229,7 @@ void retro_set_environment(retro_environment_t cb)
             { "A500PLUS", "A500+ (1MB Chip + 1MB Slow)" },
             { "A600", "A600 (2MB Chip + 8MB Fast)" },
             { "A1200", "A1200 (2MB Chip + 8MB Fast)" },
+            { "A1200OG", "A1200 (2MB Chip)" },
             { NULL, NULL },
          },
          "A500"
@@ -215,6 +244,29 @@ void retro_set_environment(retro_environment_t cb)
             { NULL, NULL },
          },
          "PAL"
+      },
+      {
+         "puae_video_aspect",
+         "Aspect ratio",
+         "",
+         {
+            { "Auto", "Automatic" },
+            { "PAL", NULL },
+            { "NTSC", NULL },
+            { NULL, NULL },
+         },
+         "Auto"
+      },
+      {
+         "puae_video_allow_hz_change",
+         "Allow PAL/NTSC Hz change",
+         "",
+         {
+            { "enabled", NULL },
+            { "disabled", NULL },
+            { NULL, NULL },
+         },
+         "enabled"
       },
       {
          "puae_video_hires",
@@ -243,14 +295,20 @@ void retro_set_environment(retro_environment_t cb)
          "Statusbar position",
          "",
          {
+            { "bottom6", "Bottom - 6" },
+            { "bottom5", "Bottom - 5" },
+            { "bottom4", "Bottom - 4" },
+            { "bottom3", "Bottom - 3" },
+            { "bottom2", "Bottom - 2" },
+            { "bottom1", "Bottom - 1" },
             { "bottom", "Bottom" },
-            { "bottom1", "Bottom + 1" },
-            { "bottom2", "Bottom + 2" },
-            { "bottom3", "Bottom + 3" },
             { "top", "Top" },
             { "top1", "Top + 1" },
             { "top2", "Top + 2" },
             { "top3", "Top + 3" },
+            { "top4", "Top + 4" },
+            { "top5", "Top + 5" },
+            { "top6", "Top + 6" },
             { NULL, NULL },
          },
          "bottom"
@@ -269,7 +327,7 @@ void retro_set_environment(retro_environment_t cb)
       {
          "puae_cpu_speed",
          "CPU speed",
-         "Needs restart",
+         "Needs restart. Max needs cycle exact off",
          {
             { "real", "Real" },
             { "max", "Max" },
@@ -304,13 +362,13 @@ void retro_set_environment(retro_environment_t cb)
          "Sound output",
          "",
          {
-            { "normal", "Normal" },
             { "exact", "Exact" },
+            { "normal", "Normal" },
             { "interrupts", "Interrupts" },
             { "none", "None" },
             { NULL, NULL },
          },
-         "normal"
+         "exact"
       },
       {
          "puae_sound_stereo_separation",
@@ -370,7 +428,7 @@ void retro_set_environment(retro_environment_t cb)
       {
          "puae_floppy_speed",
          "Floppy speed",
-         "Needs restart",
+         "",
          {
             { "100", "1x" },
             { "200", "2x" },
@@ -384,7 +442,7 @@ void retro_set_environment(retro_environment_t cb)
       {
          "puae_floppy_sound",
          "Floppy sound emulation",
-         "Needs restart and external files in system/uae_data/",
+         "Needs external files in system/uae_data/",
          {
             { "100", "disabled" },
             { "90", "10\% volume" },
@@ -402,20 +460,32 @@ void retro_set_environment(retro_environment_t cb)
          "100"
       },
       {
-         "puae_immediate_blits",
-         "Immediate blits",
-         "Needs restart",
+         "puae_gfx_framerate",
+         "Frameskip",
+         "Cycle exact needs to be off for this to come into effect at startup",
          {
-            { "false", "disabled" },
-            { "true", "enabled" },
+            { "disabled", NULL },
+            { "1", NULL },
+            { "2", NULL },
             { NULL, NULL },
          },
-         "false"
+         "disabled"
+      },
+      {
+         "puae_gfx_colors",
+         "Color depth",
+         "24bit is slower and not available on all platforms. Need restart",
+         {
+            { "16bit", "Thousands (16bit)" },
+            { "24bit", "Millions (24bit)" },
+            { NULL, NULL },
+         },
+         "16bit"
       },
       {
          "puae_collision_level",
          "Collision level",
-         "Playfields is recommended default. Needs restart",
+         "Playfields is recommended default",
          {
             { "playfields", "Sprites and Playfields" },
             { "sprites", "Sprites only" },
@@ -426,39 +496,99 @@ void retro_set_environment(retro_environment_t cb)
          "playfields"
       },
       {
-         "puae_gfx_framerate",
-         "Frameskip",
-         "Cycle exact needs to be false for this to come into effect at startup",
+         "puae_immediate_blits",
+         "Immediate blits",
+         "",
          {
-            { "disabled", NULL },
-            { "1", NULL },
-            { "2", NULL },
-         },
-         "disabled"
-      },
-      {
-         "puae_gfx_center_vertical",
-         "Vertical centering",
-         "Needs restart",
-         {
-            { "simple", "Simple" },
-            { "smart", "Smart" },
-            { "none", "disabled" },
+            { "false", "disabled" },
+            { "true", "enabled" },
             { NULL, NULL },
          },
-         "simple"
+         "false"
       },
       {
          "puae_gfx_center_horizontal",
          "Horizontal centering",
-         "Needs restart",
+         "Essential with crop overscan enabled",
          {
+            { "none", "disabled" },
             { "simple", "Simple" },
             { "smart", "Smart" },
-            { "none", "disabled" },
             { NULL, NULL },
          },
-         "simple"
+         "none"
+      },
+      {
+         "puae_gfx_center_vertical",
+         "Vertical centering",
+         "Essential with crop overscan enabled",
+         {
+            { "none", "disabled" },
+            { "simple", "Simple" },
+            { "smart", "Smart" },
+            { NULL, NULL },
+         },
+         "none"
+      },
+      {
+         "puae_zoom_mode",
+         "Zoom mode",
+         "Zoom requires vertical centering: off,  integer scaling: off, and aspect ratio: core provided for best results",
+         {
+            { "None", "disabled" },
+            { "Small", NULL },
+            { "Medium", NULL },
+            { "Large", NULL },
+            { "Larger", NULL },
+            { "Maximum", NULL },
+            { NULL, NULL },
+         },
+         "None"
+      },
+      {
+         "puae_vertical_pos",
+         "Vertical position",
+         "Allows to shift the screen up and down, useful to manually center the screen",
+         {
+            { "0", NULL },
+            { "2", NULL },
+            { "4", NULL },
+            { "6", NULL },
+            { "8", NULL },
+            { "10", NULL },
+            { "12", NULL },
+            { "14", NULL },
+            { "16", NULL },
+            { "18", NULL },
+            { "20", NULL },
+            { "22", NULL },
+            { "24", NULL },
+            { "26", NULL },
+            { "28", NULL },
+            { "30", NULL },
+            { "32", NULL },
+            { "34", NULL },
+            { "36", NULL },
+            { "38", NULL },
+            { "40", NULL },
+            { "42", NULL },
+            { "44", NULL },
+            { "46", NULL },
+            { "48", NULL },
+            { "50", NULL },
+            { "-2", NULL },
+            { "-4", NULL },
+            { "-6", NULL },
+            { "-8", NULL },
+            { "-10", NULL },
+            { "-12", NULL },
+            { "-14", NULL },
+            { "-16", NULL },
+            { "-18", NULL },
+            { "-20", NULL },
+            { NULL, NULL },
+         },
+         "0"
       },
       {
          "puae_use_whdload",
@@ -482,7 +612,7 @@ void retro_set_environment(retro_environment_t cb)
             { "both", "Both analogs" },
             { NULL, NULL },
          },
-         "disabled"
+         "right"
       },
       {
          "puae_analogmouse_deadzone",
@@ -519,7 +649,7 @@ void retro_set_environment(retro_environment_t cb)
             { "0.9", "90\%" },
             { NULL, NULL },
          },
-         "10"
+         "1.0"
       },
       {
          "puae_keyrah_keypad_mappings",
@@ -562,8 +692,22 @@ void retro_set_environment(retro_environment_t cb)
          "---"
       },
       {
-         "puae_mapper_gui",
-         "Hotkey: Enter GUI",
+         "puae_mapper_reset",
+         "Hotkey: Reset",
+         "Ctrl-Amiga-Amiga",
+         {{ NULL, NULL }},
+         "---"
+      },
+      {
+         "puae_mapper_aspect_ratio_toggle",
+         "Hotkey: Toggle aspect ratio",
+         "Only usable with PAL video",
+         {{ NULL, NULL }},
+         "---"
+      },
+      {
+         "puae_mapper_zoom_mode_toggle",
+         "Hotkey: Toggle zoom mode",
          "",
          {{ NULL, NULL }},
          "---"
@@ -752,7 +896,9 @@ void retro_set_environment(retro_environment_t cb)
          || strstr(core_options[i].key, "puae_mapper_statusbar")
          || strstr(core_options[i].key, "puae_mapper_mouse_toggle")
          || strstr(core_options[i].key, "puae_mapper_mouse_speed")
-         || strstr(core_options[i].key, "puae_mapper_gui")
+         || strstr(core_options[i].key, "puae_mapper_reset")
+         || strstr(core_options[i].key, "puae_mapper_aspect_ratio_toggle")
+         || strstr(core_options[i].key, "puae_mapper_zoom_mode_toggle")
          )
             hotkey = 1;
          else
@@ -833,31 +979,36 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		if (strcmp(var.value, "A500") == 0)
-		{
-			strcat(uae_machine, A500);
-			strcpy(uae_kickstart, A500_ROM);
-		}
-		if (strcmp(var.value, "A500OG") == 0)
-		{
-			strcat(uae_machine, A500OG);
-			strcpy(uae_kickstart, A500_ROM);
-		}
-		if (strcmp(var.value, "A500PLUS") == 0)
-		{
-			strcat(uae_machine, A500PLUS);
-			strcpy(uae_kickstart, A500KS2_ROM);
-		}
-		if (strcmp(var.value, "A600") == 0)
-		{
-			strcat(uae_machine, A600);
-			strcpy(uae_kickstart, A600_ROM);
-		}
-		if (strcmp(var.value, "A1200") == 0)
-		{
-			strcat(uae_machine, A1200);
-			strcpy(uae_kickstart, A1200_ROM);
-		}
+      if (strcmp(var.value, "A500") == 0)
+      {
+          strcat(uae_machine, A500);
+          strcpy(uae_kickstart, A500_ROM);
+      }
+      if (strcmp(var.value, "A500OG") == 0)
+      {
+          strcat(uae_machine, A500OG);
+          strcpy(uae_kickstart, A500_ROM);
+      }
+      if (strcmp(var.value, "A500PLUS") == 0)
+      {
+          strcat(uae_machine, A500PLUS);
+          strcpy(uae_kickstart, A500KS2_ROM);
+      }
+      if (strcmp(var.value, "A600") == 0)
+      {
+          strcat(uae_machine, A600);
+          strcpy(uae_kickstart, A600_ROM);
+      }
+      if (strcmp(var.value, "A1200") == 0)
+      {
+          strcat(uae_machine, A1200);
+          strcpy(uae_kickstart, A1200_ROM);
+      }
+      if (strcmp(var.value, "A1200OG") == 0)
+      {
+          strcat(uae_machine, A1200OG);
+          strcpy(uae_kickstart, A1200_ROM);
+      }
    }
 
    var.key = "puae_video_standard";
@@ -865,16 +1016,38 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      if(strcmp(var.value, "PAL") == 0)
-      {
-         video_config |= PUAE_VIDEO_PAL;
-         strcat(uae_config, "ntsc=false\n");
-      }
-      else
-      {
-         video_config |= PUAE_VIDEO_NTSC;
-         strcat(uae_config, "ntsc=true\n");
-      }
+      /* video_config change only at start */
+      if(video_config_old == 0)
+         if(strcmp(var.value, "PAL") == 0)
+         {
+            video_config |= PUAE_VIDEO_PAL;
+            strcat(uae_config, "ntsc=false\n");
+         }
+         else
+         {
+            video_config |= PUAE_VIDEO_NTSC;
+            strcat(uae_config, "ntsc=true\n");
+            real_ntsc = true;
+         }
+   }
+
+   var.key = "puae_video_aspect";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if(strcmp(var.value, "Auto") == 0) video_config_aspect = 0;
+      else if(strcmp(var.value, "PAL") == 0) video_config_aspect = PUAE_VIDEO_PAL;
+      else if(strcmp(var.value, "NTSC") == 0) video_config_aspect = PUAE_VIDEO_NTSC;
+   }
+
+   var.key = "puae_video_allow_hz_change";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if(strcmp(var.value, "enabled") == 0) video_config_allow_hz_change = 1;
+      else if(strcmp(var.value, "disabled") == 0) video_config_allow_hz_change = 0;
    }
 
    var.key = "puae_video_hires";
@@ -882,8 +1055,10 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-	   if(strcmp(var.value, "true") == 0)
-		   video_config |= PUAE_VIDEO_HIRES;
+      if(strcmp(var.value, "true") == 0)
+         video_config |= PUAE_VIDEO_HIRES;
+      else
+         video_config &= ~PUAE_VIDEO_HIRES;
    }
 
    var.key = "puae_video_crop_overscan";
@@ -891,8 +1066,10 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-	   if(strcmp(var.value, "true") == 0)
-		   video_config |= PUAE_VIDEO_CROP;
+      if(strcmp(var.value, "true") == 0)
+         video_config |= PUAE_VIDEO_CROP;
+      else
+         video_config &= ~PUAE_VIDEO_CROP;
    }
 
    var.key = "puae_enhanced_statusbar";
@@ -920,19 +1097,25 @@ static void update_variables(void)
       else if(strcmp(var.value, "top1") == 0) opt_statusbar_position = -10;
       else if(strcmp(var.value, "top2") == 0) opt_statusbar_position = -20;
       else if(strcmp(var.value, "top3") == 0) opt_statusbar_position = -30;
+      else if(strcmp(var.value, "top4") == 0) opt_statusbar_position = -40;
+      else if(strcmp(var.value, "top5") == 0) opt_statusbar_position = -50;
+      else if(strcmp(var.value, "top6") == 0) opt_statusbar_position = -60;
       else if(strcmp(var.value, "bottom") == 0) opt_statusbar_position = 0;
       else if(strcmp(var.value, "bottom1") == 0) opt_statusbar_position = 10;
       else if(strcmp(var.value, "bottom2") == 0) opt_statusbar_position = 20;
       else if(strcmp(var.value, "bottom3") == 0) opt_statusbar_position = 30;
+      else if(strcmp(var.value, "bottom4") == 0) opt_statusbar_position = 40;
+      else if(strcmp(var.value, "bottom5") == 0) opt_statusbar_position = 50;
+      else if(strcmp(var.value, "bottom6") == 0) opt_statusbar_position = 60;
 
       /* Exceptions for lo-res and enhanced statusbar */
       if(video_config & 0x04) // PUAE_VIDEO_HIRES
          ;
       else
          if(opt_enhanced_statusbar)
-            opt_statusbar_position = (opt_statusbar_position < 0) ? ((opt_statusbar_position==-1) ? -10 : opt_statusbar_position-10) : opt_statusbar_position+12;
+            opt_statusbar_position = (opt_statusbar_position < 0) ? ((opt_statusbar_position==-1) ? -10 : opt_statusbar_position-10) : opt_statusbar_position+10;
          else
-            opt_statusbar_position = (opt_statusbar_position < 0) ? ((opt_statusbar_position==-1) ? -2 : opt_statusbar_position-2) : opt_statusbar_position+2;
+            opt_statusbar_position = (opt_statusbar_position < 0) ? ((opt_statusbar_position==-1) ? -1 : opt_statusbar_position-2) : opt_statusbar_position;
 
       /* Screen refresh required */
       if(opt_statusbar_position_old != opt_statusbar_position)
@@ -946,9 +1129,9 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "cpu_speed=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "cpu_speed=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
    }
 
    var.key = "puae_cpu_compatible";
@@ -956,9 +1139,19 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "cpu_compatible=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "cpu_compatible=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+   }
+
+   var.key = "puae_cycle_exact";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      strcat(uae_config, "cycle_exact=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
    }
 
    var.key = "puae_sound_output";
@@ -966,14 +1159,14 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "sound_output=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "sound_output=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
 
-		if (strcmp(var.value, "none") == 0) changed_prefs.produce_sound=0;
-		else if (strcmp(var.value, "interrupts") == 0) changed_prefs.produce_sound=1;
-		else if (strcmp(var.value, "normal") == 0) changed_prefs.produce_sound=2;
-		else if (strcmp(var.value, "exact") == 0) changed_prefs.produce_sound=3;
+      if (strcmp(var.value, "none") == 0) changed_prefs.produce_sound=0;
+      else if (strcmp(var.value, "interrupts") == 0) changed_prefs.produce_sound=1;
+      else if (strcmp(var.value, "normal") == 0) changed_prefs.produce_sound=2;
+      else if (strcmp(var.value, "exact") == 0) changed_prefs.produce_sound=3;
    }
 
    var.key = "puae_sound_stereo_separation";
@@ -981,13 +1174,14 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		int val = atoi(var.value) / 10;
-		changed_prefs.sound_stereo_separation=val;
-		char buf[50];
-		snprintf(buf, 50, "%d", val);
-		strcat(uae_config, "sound_stereo_separation=");
-		strcat(uae_config, buf);
-		strcat(uae_config, "\n");
+      int val = atoi(var.value) / 10;
+      changed_prefs.sound_stereo_separation=val;
+
+      char valbuf[50];
+      snprintf(valbuf, 50, "%d", val);
+      strcat(uae_config, "sound_stereo_separation=");
+      strcat(uae_config, valbuf);
+      strcat(uae_config, "\n");
    }
 
    var.key = "puae_sound_interpol";
@@ -995,15 +1189,15 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "sound_interpol=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "sound_interpol=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
 
-		if (strcmp(var.value, "none") == 0) changed_prefs.sound_interpol=0;
-		else if (strcmp(var.value, "anti") == 0) changed_prefs.sound_interpol=1;
-		else if (strcmp(var.value, "sinc") == 0) changed_prefs.sound_interpol=2;
-		else if (strcmp(var.value, "rh") == 0) changed_prefs.sound_interpol=3;
-		else if (strcmp(var.value, "crux") == 0) changed_prefs.sound_interpol=4;
+      if (strcmp(var.value, "none") == 0) changed_prefs.sound_interpol=0;
+      else if (strcmp(var.value, "anti") == 0) changed_prefs.sound_interpol=1;
+      else if (strcmp(var.value, "sinc") == 0) changed_prefs.sound_interpol=2;
+      else if (strcmp(var.value, "rh") == 0) changed_prefs.sound_interpol=3;
+      else if (strcmp(var.value, "crux") == 0) changed_prefs.sound_interpol=4;
    }
 
    var.key = "puae_sound_filter";
@@ -1038,9 +1232,12 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "floppy_speed=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "floppy_speed=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      if(firstpass != 1)
+         changed_prefs.floppy_speed=atoi(var.value);
    }
 
    var.key = "puae_floppy_sound";
@@ -1048,11 +1245,15 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-        /* Sound is enabled by default if files are found, so this needs to be set always */
-        /* 100 is mute, 0 is max */
-        strcat(uae_config, "floppy_volume=");
-        strcat(uae_config, var.value);
-        strcat(uae_config, "\n");
+      /* Sound is enabled by default if files are found, so this needs to be set always */
+      /* 100 is mute, 0 is max */
+      strcat(uae_config, "floppy_volume=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      /* Setting volume in realtime will crash on first pass */
+      if(firstpass != 1)
+         changed_prefs.dfxclickvolume=atoi(var.value);
    }
 
    var.key = "puae_immediate_blits";
@@ -1060,9 +1261,15 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "immediate_blits=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "immediate_blits=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      if(firstpass != 1)
+      {
+         if (strcmp(var.value, "false") == 0) changed_prefs.immediate_blits=0;
+         else if (strcmp(var.value, "true") == 0) changed_prefs.immediate_blits=1;
+      }
    }
 
    var.key = "puae_collision_level";
@@ -1070,9 +1277,17 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "collision_level=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "collision_level=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      if(firstpass != 1)
+      {
+         if (strcmp(var.value, "none") == 0) changed_prefs.collision_level=0;
+         else if (strcmp(var.value, "sprites") == 0) changed_prefs.collision_level=1;
+         else if (strcmp(var.value, "playfields") == 0) changed_prefs.collision_level=2;
+         else if (strcmp(var.value, "full") == 0) changed_prefs.collision_level=3;
+      }
    }
 
    var.key = "puae_gfx_framerate";
@@ -1081,19 +1296,51 @@ static void update_variables(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       int val;
-
       if (strcmp(var.value, "disabled") == 0) val=1;
       else if (strcmp(var.value, "1") == 0) val=2;
-      else if (strcmp(var.value, "2") == 0) val=4;
-
+      else if (strcmp(var.value, "2") == 0) val=3;
       changed_prefs.gfx_framerate=val;
-      char buf2[50];
-      snprintf(buf2, 50, "%d", val);
 
-      if(val>1) {
+      if(val>1)
+      {
+         char valbuf[50];
+         snprintf(valbuf, 50, "%d", val);
          strcat(uae_config, "gfx_framerate=");
-         strcat(uae_config, buf2);
+         strcat(uae_config, valbuf);
          strcat(uae_config, "\n");
+      }
+   }
+
+   var.key = "puae_gfx_colors";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      // Only allow screenmode change after restart
+      if (!pix_bytes_initialized)
+      {
+         if (strcmp(var.value, "16bit") == 0) pix_bytes=2;
+         else if (strcmp(var.value, "24bit") == 0) pix_bytes=4;
+         pix_bytes_initialized = true;
+      }
+   }
+
+   var.key = "puae_gfx_center_horizontal";
+   var.value = NULL;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      strcat(uae_config, "gfx_center_horizontal=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      if(firstpass != 1)
+      {
+         int val;
+         if (strcmp(var.value, "none") == 0) val=0;
+         else if (strcmp(var.value, "simple") == 0) val=1;
+         else if (strcmp(var.value, "smart") == 0) val=2;
+         changed_prefs.gfx_xcenter=val;
       }
    }
 
@@ -1102,29 +1349,47 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "gfx_center_vertical=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      strcat(uae_config, "gfx_center_vertical=");
+      strcat(uae_config, var.value);
+      strcat(uae_config, "\n");
+
+      if(firstpass != 1)
+      {
+         int val;
+         if (strcmp(var.value, "none") == 0) val=0;
+         else if (strcmp(var.value, "simple") == 0) val=1;
+         else if (strcmp(var.value, "smart") == 0) val=2;
+         changed_prefs.gfx_ycenter=val;
+      }
    }
 
-   var.key = "puae_gfx_center_horizontal";
+   var.key = "puae_zoom_mode";
    var.value = NULL;
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "gfx_center_horizontal=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      if (strcmp(var.value, "None") == 0) zoom_mode_id=0;
+      else if (strcmp(var.value, "Small") == 0) zoom_mode_id=1;
+      else if (strcmp(var.value, "Medium") == 0) zoom_mode_id=2;
+      else if (strcmp(var.value, "Large") == 0) zoom_mode_id=3;
+      else if (strcmp(var.value, "Larger") == 0) zoom_mode_id=4;
+      else if (strcmp(var.value, "Maximum") == 0) zoom_mode_id=5;
    }
 
-   var.key = "puae_cycle_exact";
+   var.key = "puae_vertical_pos";
    var.value = NULL;
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-		strcat(uae_config, "cycle_exact=");
-		strcat(uae_config, var.value);
-		strcat(uae_config, "\n");
+      int new_vertical_offset = atoi(var.value);
+      if (new_vertical_offset >= -20 && new_vertical_offset <= 50)
+      {
+         /* this offset is used whenever minfirstline is reset on gfx mode changes in the init_hz() function */
+         opt_vertical_offset = new_vertical_offset;
+         /* we need to update the currently used minfirstline, too, for immediate effect */
+         /* 26 is the PUAE default for minfirstline */
+         minfirstline = 26 + opt_vertical_offset;
+      }
    }
 
    var.key = "puae_use_whdload";
@@ -1143,10 +1408,10 @@ static void update_variables(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
-      if (strcmp(var.value, "disabled") == 0) opt_analogmouse = 0;
-      else if (strcmp(var.value, "left") == 0) opt_analogmouse = 1;
-      else if (strcmp(var.value, "right") == 0) opt_analogmouse = 2;
-      else if (strcmp(var.value, "both") == 0) opt_analogmouse = 3;
+      if (strcmp(var.value, "disabled") == 0) opt_analogmouse=0;
+      else if (strcmp(var.value, "left") == 0) opt_analogmouse=1;
+      else if (strcmp(var.value, "right") == 0) opt_analogmouse=2;
+      else if (strcmp(var.value, "both") == 0) opt_analogmouse=3;
    }
 
    var.key = "puae_analogmouse_deadzone";
@@ -1367,39 +1632,50 @@ static void update_variables(void)
       mapper_keys[27] = keyId(var.value);
    }
 
-   var.key = "puae_mapper_gui";
+   var.key = "puae_mapper_reset";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
       mapper_keys[28] = keyId(var.value);
    }
 
+   var.key = "puae_mapper_aspect_ratio_toggle";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      mapper_keys[29] = keyId(var.value);
+   }
+
+   var.key = "puae_mapper_zoom_mode_toggle";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      mapper_keys[30] = keyId(var.value);
+   }
 
 
-    /* Always trigger audio change */
-    config_changed = 1;
-    check_prefs_changed_audio();
 
-	// Setting resolution
-	// According to PUAE configuration.txt :
-	//
-	// To emulate a high-resolution, fully overscanned PAL screen - either
-	// non-interlaced with line-doubling, or interlaced - you need to use a
-	// display of at least 720 by 568 pixels. If you specify a smaller size,
-	// E-UAE's display will be clipped to fit (and you can use the gfx_center_*
-	// options - see below - to centre the clipped region of the display).
-	// Similarly, to fully display an over-scanned lo-res PAL screen, you need a
-	// display of 360 by 284 pixels.
-	//
-	// So, here are the standard resolutions :
-	// - **360x284**: PAL Low resolution with overscan
-	// - **320x256**: PAL Low resolution cropped/clipped (without the "borders")
-	// - **360x240**: NTSC Low resolution with overscan
-	// - **320×200**: NTSC Low resolution cropped/clipped (without the "borders")
-	// - **720x568**: PAL High resolution with overscan
-	// - **640×512**: PAL High resolution cropped/clipped (without the "borders")
-	// - **720x480**: NTSC High resolution with overscan
-	// - **640×400**: NTSC High resolution cropped/clipped (without the "borders")
+
+   // Setting resolution
+   // According to PUAE configuration.txt :
+   //
+   // To emulate a high-resolution, fully overscanned PAL screen - either
+   // non-interlaced with line-doubling, or interlaced - you need to use a
+   // display of at least 720 by 568 pixels. If you specify a smaller size,
+   // E-UAE's display will be clipped to fit (and you can use the gfx_center_*
+   // options - see below - to centre the clipped region of the display).
+   // Similarly, to fully display an over-scanned lo-res PAL screen, you need a
+   // display of 360 by 284 pixels.
+   //
+   // So, here are the standard resolutions :
+   // - **360x284**: PAL Low resolution with overscan
+   // - **320x256**: PAL Low resolution cropped/clipped (without the "borders")
+   // - **360x240**: NTSC Low resolution with overscan
+   // - **320×200**: NTSC Low resolution cropped/clipped (without the "borders")
+   // - **720x568**: PAL High resolution with overscan
+   // - **640×512**: PAL High resolution cropped/clipped (without the "borders")
+   // - **720x480**: NTSC High resolution with overscan
+   // - **640×400**: NTSC High resolution cropped/clipped (without the "borders")
    switch(video_config)
    {
 		case PUAE_VIDEO_PAL_OV_LO:
@@ -1451,14 +1727,21 @@ static void update_variables(void)
 			strcat(uae_config, "gfx_linemode=double\n");
 			break;
    }
+
+   /* Always update av_info geometry */
+   request_update_av_info = true;
+
+   /* Always trigger audio and custom change */
+   config_changed = 1;
+   check_prefs_changed_audio();
+   check_prefs_changed_custom();
+   config_changed = 0;
 }
 
 static void retro_wrap_emulator(void)
 {
    static char *argv[] = { "puae", RPATH };
    umain(sizeof(argv)/sizeof(*argv), argv);
-
-   pauseg = -1;
 
    environ_cb(RETRO_ENVIRONMENT_SHUTDOWN, 0); 
 
@@ -1478,8 +1761,6 @@ static void retro_wrap_emulator(void)
 //*****************************************************************************
 // Disk control
 extern void DISK_check_change(void);
-extern const char* Floppy_SetDiskFileNameNone(int Drive);
-extern const char* Floppy_SetDiskFileName(int Drive, const char *pszFileName, const char *pszZipPath);
 extern void disk_eject (int num);
 
 static bool disk_set_eject_state(bool ejected)
@@ -1493,7 +1774,6 @@ static bool disk_set_eject_state(bool ejected)
 		
 		if (dc->eject_state)
 		{
-			Floppy_SetDiskFileNameNone(0);
 			changed_prefs.floppyslots[0].df[0] = 0;
 			DISK_check_change();
 			disk_eject(0);
@@ -1502,11 +1782,8 @@ static bool disk_set_eject_state(bool ejected)
 		{
 			if (strlen(dc->files[dc->index]) > 0)
 			{
-				if (File_Exists(dc->files[dc->index]))
+				if (file_exists(dc->files[dc->index]))
 				{
-					// This sets szDiskFileName[0]
-					Floppy_SetDiskFileName(0, dc->files[dc->index], 0);
-
 					if (currprefs.nr_floppies-1 < 0 )
 						currprefs.nr_floppies = 1;
 
@@ -1662,6 +1939,10 @@ void retro_init(void)
 	dc = dc_create();
 	environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, &disk_interface);
 
+   // Savestates
+   static uint32_t quirks = RETRO_SERIALIZATION_QUIRK_INCOMPLETE | RETRO_SERIALIZATION_QUIRK_MUST_INITIALIZE | RETRO_SERIALIZATION_QUIRK_CORE_VARIABLE_SIZE;
+   environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &quirks);
+
 	// Inputs
 #define RETRO_DESCRIPTOR_BLOCK( _user )                                            \
    { _user, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "A / 2nd fire / Blue" },\
@@ -1708,13 +1989,9 @@ void retro_init(void)
       exit(0);//return false;
    }
 
-   InitOSGLU();
    memset(bmp, 0, sizeof(bmp));
 
    update_variables();
-
-   CROP_WIDTH    = retrow;
-   CROP_HEIGHT   = (retroh - 80);
 
    if(!emuThread && !mainThread)
    {
@@ -1725,8 +2002,6 @@ void retro_init(void)
 
 void retro_deinit(void)
 {	
-   UnInitOSGLU();	
-
    if(emuThread)
       co_delete(emuThread);
    emuThread = 0;
@@ -1791,15 +2066,269 @@ void retro_get_system_info(struct retro_system_info *info)
    info->valid_extensions = "adf|dms|fdi|ipf|zip|hdf|hdz|uae|m3u";
 }
 
+bool retro_update_av_info(bool change_geometry, bool change_timing, bool isntsc)
+{
+   request_update_av_info = false;
+   float hz = currprefs.chipset_refreshrate;
+   fprintf(stderr, "[libretro-uae]: Trying to update AV geometry:%d timing:%d, to: ntsc:%d hz:%2.2f, from video_config:%d, video_aspect:%d\n", change_geometry, change_timing, isntsc, hz, video_config, video_config_aspect);
+
+   /* Change PAL/NTSC with a twist, thanks to Dyna Blaster
+
+      Early Startup switch looks proper:
+         PAL mode V=49.9201Hz H=15625.0881Hz (227x312+1) IDX=10 (PAL) D=0 RTG=0/0
+         NTSC mode V=59.8859Hz H=15590.7473Hz (227x262+1) IDX=11 (NTSC) D=0 RTG=0/0
+         PAL mode V=49.9201Hz H=15625.0881Hz (227x312+1) IDX=10 (PAL) D=0 RTG=0/0
+
+      Dyna Blaster switch looks unorthodox:
+         PAL mode V=49.9201Hz H=15625.0881Hz (227x312+1) IDX=10 (PAL) D=0 RTG=0/0
+         PAL mode V=59.4106Hz H=15625.0881Hz (227x312+1) IDX=10 (PAL) D=0 RTG=0/0
+         PAL mode V=49.9201Hz H=15625.0881Hz (227x312+1) IDX=10 (PAL) D=0 RTG=0/0
+   */
+
+   video_config_old = video_config;
+   video_config_geometry = video_config;
+
+   /* When timing & geometry is changed */
+   if(change_timing)
+   {
+      /* Change to NTSC if not NTSC */
+      if (isntsc && (video_config & PUAE_VIDEO_PAL) && !fake_ntsc)
+      {
+         video_config |= PUAE_VIDEO_NTSC;
+         video_config &= ~PUAE_VIDEO_PAL;
+      }
+      /* Change to PAL if not PAL */
+      else if (!isntsc && (video_config & PUAE_VIDEO_NTSC) && !fake_ntsc)
+      {
+         video_config |= PUAE_VIDEO_PAL;
+         video_config &= ~PUAE_VIDEO_NTSC;
+      }
+
+      /* Main video config will be changed too */
+      video_config_geometry = video_config;
+   }
+
+   /* Aspect ratio override always changes only temporary video config */
+   if (video_config_aspect == PUAE_VIDEO_NTSC)
+   {
+      video_config_geometry |= PUAE_VIDEO_NTSC;
+      video_config_geometry &= ~PUAE_VIDEO_PAL;
+   }
+   else if (video_config_aspect == PUAE_VIDEO_PAL)
+   {
+      video_config_geometry |= PUAE_VIDEO_PAL;
+      video_config_geometry &= ~PUAE_VIDEO_NTSC;
+   }
+
+   /* Do nothing if timing has not changed, unless Hz switched without isntsc */
+   if(video_config_old == video_config && change_timing)
+   {
+      /* Dyna Blaster and the like stays at fake NTSC to prevent pointless switching back and forth */
+      if (!isntsc && hz > 55)
+      {
+         video_config |= PUAE_VIDEO_NTSC;
+         video_config &= ~PUAE_VIDEO_PAL;
+         video_config_geometry = video_config;
+         fake_ntsc=true;
+      }
+
+      /* If still no change */
+      if(video_config_old == video_config)
+      {
+         fprintf(stderr, "[libretro-uae]: Already at wanted AV\n");
+         return false;
+      }
+   }
+
+   /* Geometry dimensions */
+   switch(video_config_geometry)
+   {
+      case PUAE_VIDEO_PAL_OV_LO:
+         retrow = 360;
+         retroh = 284;
+         break;
+      case PUAE_VIDEO_PAL_CR_LO:
+         retrow = 320;
+         retroh = 256;
+         break;
+      case PUAE_VIDEO_NTSC_OV_LO:
+         retrow = 360;
+         retroh = 240;
+         break;
+      case PUAE_VIDEO_NTSC_CR_LO:
+         retrow = 320;
+         retroh = 200;
+         break;
+      case PUAE_VIDEO_PAL_OV_HI:
+         retrow = 720;
+         retroh = 568;
+         break;
+      case PUAE_VIDEO_PAL_CR_HI:
+         retrow = 640;
+         retroh = 512;
+         break;
+      case PUAE_VIDEO_NTSC_OV_HI:
+         retrow = 720;
+         retroh = 480;
+         break;
+      case PUAE_VIDEO_NTSC_CR_HI:
+         retrow = 640;
+         retroh = 400;
+         break;
+   }
+
+   /* Special cropped height for Dyna Blaster (uncropped will leave some statusbar trails, but who cares since they will be cleaned up by itself */
+   if(fake_ntsc && video_config & PUAE_VIDEO_CROP)
+   {
+      retroh = ((video_config & PUAE_VIDEO_HIRES) ? 460 : 230);
+   }
+
+   /* When the actual dimensions change and not just the view */
+   if(change_timing || fake_ntsc)
+   {
+      defaultw = retrow;
+      defaulth = retroh;
+   }
+
+   static struct retro_system_av_info new_av_info;
+   new_av_info.geometry.base_width = retrow;
+   new_av_info.geometry.base_height = retroh;
+
+   if(video_config_geometry & PUAE_VIDEO_NTSC || video_config_aspect == PUAE_VIDEO_NTSC) {
+      new_av_info.geometry.aspect_ratio=(float)retrow/(float)retroh * 44.0/52.0;
+      hz = 60;
+   } else {
+      new_av_info.geometry.aspect_ratio=(float)retrow/(float)retroh;
+      hz = 50;
+   }
+
+   /* Disable Hz change if not allowed */
+   if(!video_config_allow_hz_change)
+      change_timing = 0;
+
+   /* Logging */
+   if(change_geometry && change_timing) {
+      fprintf(stderr, "[libretro-uae]: Update av_info: %dx%d %2.2fHz, video_config:%d\n", retrow, retroh, hz, video_config_geometry);
+   } else if(change_geometry && !change_timing) {
+      fprintf(stderr, "[libretro-uae]: Update geometry: %dx%d, video_config:%d\n", retrow, retroh, video_config_geometry);
+   } else if(!change_geometry && change_timing) {
+      fprintf(stderr, "[libretro-uae]: Update timing: %2.2fHz, video_config:%d\n", hz, video_config_geometry);
+   }
+
+   if(change_timing) {
+      struct retro_system_av_info new_timing;
+      retro_get_system_av_info(&new_timing);
+      new_timing.timing.fps = hz;
+      environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &new_timing);
+   }
+
+   if(change_geometry) {
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &new_av_info);
+
+      /* ensure statusbar stays visible when it is at bottom */
+      opt_statusbar_position = opt_statusbar_position_old;
+      if(!change_timing)
+         if(retroh < defaulth)
+            if (opt_statusbar_position >= 0 && (defaulth - retroh) > opt_statusbar_position)
+               opt_statusbar_position = defaulth - retroh;
+
+      //printf("statusbar:%d old:%d, retroh:%d defaulth:%d\n", opt_statusbar_position, opt_statusbar_position_old, retroh, defaulth);
+   }
+
+   /* apply zoom mode if necessary */
+   zoomed_height = retroh;
+   switch (zoom_mode_id)
+   {
+      case 1:
+         if (video_config & PUAE_VIDEO_HIRES)
+            zoomed_height = 512;
+         else
+            zoomed_height = 256;
+         break;
+      case 2:
+         if (video_config & PUAE_VIDEO_HIRES)
+            zoomed_height = 480;
+         else
+            zoomed_height = 240;
+         break;
+      case 3:
+         if (video_config & PUAE_VIDEO_HIRES)
+            zoomed_height = 448;
+         else
+            zoomed_height = 224;
+         break;
+      case 4:
+         if (video_config & PUAE_VIDEO_HIRES)
+            zoomed_height = 432;
+         else
+            zoomed_height = 216;
+         break;
+      case 5:
+         if (video_config & PUAE_VIDEO_HIRES)
+            zoomed_height = 400;
+         else
+            zoomed_height = 200;
+         break;
+      default:
+         break;
+   }
+
+   if (zoomed_height > retroh)
+      zoomed_height = retroh;
+
+   if (zoomed_height != retroh)
+   {
+      new_av_info.geometry.base_height = zoomed_height;
+      if(video_config_geometry & PUAE_VIDEO_NTSC || video_config_aspect == PUAE_VIDEO_NTSC) {
+         new_av_info.geometry.aspect_ratio=(float)retrow/(float)zoomed_height * 44.0/52.0;
+      } else {
+         new_av_info.geometry.aspect_ratio=(float)retrow/(float)zoomed_height;
+      }
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &new_av_info);
+
+      /* ensure statusbar stays visible when it is at bottom */
+      if (opt_statusbar_position >= 0 && (retroh - zoomed_height) > opt_statusbar_position)
+         opt_statusbar_position = retroh - zoomed_height;
+   }
+
+   /* No need to check changed gfx at startup */
+   if(firstpass != 1) {
+      prefs_changed = 1; // check_prefs_changed_gfx() will be called automatically in vsync_handle_check()
+   }
+
+   return true;
+}
+
 void retro_get_system_av_info(struct retro_system_av_info *info)
 {
-   static struct retro_game_geometry geom480   = { 640, 480, EMULATOR_MAX_WIDTH, EMULATOR_MAX_HEIGHT, 4.0 / 3.0 };
-   static struct retro_game_geometry geom540   = { 720, 540, EMULATOR_MAX_WIDTH, EMULATOR_MAX_HEIGHT, 4.0 / 3.0 };
+   /* need to do this here because core option values are not available in retro_init */
+   if (pix_bytes == 4)
+   {
+      enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+      if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
+      {
+         fprintf(stderr, "[libretro-uae]: XRGB8888 is not supported. Trying RGB565\n");
+         fmt = RETRO_PIXEL_FORMAT_RGB565;
+         pix_bytes = 2;
+         if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
+         {
+            fprintf(stderr, "[libretro-uae]: RGB565 is not supported.\n");
+            exit(0);//return false;
+         }
+      }
+   }
 
-   if      (retrow == 640 && retroh == 400) info->geometry = geom480;
-   else if (retrow == 640 && retroh == 400) info->geometry = geom480;
-   else if (retrow == 720 && retroh == 540) info->geometry = geom540;
-   else { static struct retro_game_geometry geom; geom.base_width=retrow; geom.base_height=retroh; geom.max_width=EMULATOR_MAX_WIDTH; geom.max_height=EMULATOR_MAX_HEIGHT; geom.aspect_ratio=(float)retrow/(float)retroh; info->geometry = geom; }
+   static struct retro_game_geometry geom;
+   geom.base_width=retrow;
+   geom.base_height=retroh;
+   geom.max_width=EMULATOR_MAX_WIDTH;
+   geom.max_height=EMULATOR_MAX_HEIGHT;
+
+   if (retro_get_region() == RETRO_REGION_NTSC)
+      geom.aspect_ratio=(float)retrow/(float)retroh * 44.0/52.0;
+   else
+      geom.aspect_ratio=(float)retrow/(float)retroh;
+   info->geometry = geom;
 
    info->timing.sample_rate = 44100.0;
    info->timing.fps = (retro_get_region() == RETRO_REGION_NTSC) ? 60 : 50;
@@ -1828,47 +2357,12 @@ void retro_shutdown_uae(void)
 void retro_reset(void)
 {
    uae_reset(1, 1); /* hardreset, keyboardreset */
+   fake_ntsc=false;
 }
 
 void retro_audio_cb( short l, short r)
 {
    audio_cb(l,r);
-}
-
-extern unsigned short * sndbuffer;
-extern int sndbufsize;
-signed short rsnd=0;
-
-static int firstpass = 1;
-
-void save_bkg(void)
-{
-   memcpy(savebmp, bmp,sizeof(bmp));
-}
-
-void restore_bkg(void)
-{
-   memcpy(bmp,savebmp,sizeof(bmp));
-}
-
-void enter_gui0(void)
-{
-   save_bkg();
-
-   Dialog_DoProperty();
-   pauseg = 0;
-
-   restore_bkg();
-}
-
-void pause_select(void)
-{
-   if(pauseg==1 && firstps==0)
-   {
-      firstps=1;
-      enter_gui0();
-      firstps=0;
-   }
 }
 
 void retro_run(void)
@@ -1878,20 +2372,56 @@ void retro_run(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       update_variables();
 
-   if(pauseg==0)
+   bool fast_forward = false;
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &fast_forward) && fast_forward)
    {
-      if(firstpass)
+      fast_forward_is_on = true;
+      if(currprefs.sound_auto == 0)
       {
-         firstpass=0;
-         goto sortie;
+         changed_prefs.sound_auto = 1;
+         config_changed = 1;
+         check_prefs_changed_audio();
+         config_changed = 0;
       }
-      retro_poll_event();
-      if(STATUSON==1) Print_Status();
    }
+   else
+   {
+      fast_forward_is_on = false;
+      if(currprefs.sound_auto == 1)
+      {
+         changed_prefs.sound_auto = 0;
+         config_changed = 1;
+         check_prefs_changed_audio();
+         config_changed = 0;
+      }
+   }
+
+   if (request_update_av_info)
+      retro_update_av_info(1, 0, 0);
+
+   if (minfirstline_update_frame_timer > 0 && opt_vertical_offset != 0)
+   {
+      minfirstline_update_frame_timer--;
+      //printf("minfirstline frame:%d\n", minfirstline_update_frame_timer);
+      if (minfirstline_update_frame_timer == 0)
+         minfirstline = 26 + opt_vertical_offset;
+   }
+
+   if (firstpass)
+   {
+      firstpass=0;
+      goto sortie;
+   }
+
+
+
+   retro_poll_event();
+   if (STATUSON==1) Print_Status();
 
 sortie:
 
-   video_cb(bmp,retrow,retroh , retrow << 1);
+   video_cb(bmp,retrow,zoomed_height , retrow << (pix_bytes / 2));
 
    co_switch(emuThread);
 }
@@ -1940,7 +2470,28 @@ bool retro_load_game(const struct retro_game_info *info)
 				char kickstart[RETRO_PATH_MAX];
 
 				// If a machine was specified in the name of the game
-				if((strstr(full_path, "(A500+)") != NULL) || (strstr(full_path, "(A500PLUS)") != NULL))
+				if((strstr(full_path, "(A1200OG)") != NULL) || (strstr(full_path, "(A1200NF)") != NULL))
+				{
+					// Use A1200 barebone
+					printf("Found '(A1200OG)' or '(A1200NF)' in filename '%s'. Booting A1200 NoFast with Kickstart 3.1 r40.068 rom.\n", full_path);
+					fprintf(configfile, A1200OG);
+					path_join((char*)&kickstart, retro_system_directory, A1200_ROM);
+				}
+				else if((strstr(full_path, "(A1200)") != NULL) || (strstr(full_path, "(AGA)") != NULL))
+				{
+					// Use A1200
+					printf("Found '(A1200)' or '(AGA)' in filename '%s'. Booting A1200 with Kickstart 3.1 r40.068 rom.\n", full_path);
+					fprintf(configfile, A1200);
+					path_join((char*)&kickstart, retro_system_directory, A1200_ROM);
+				}
+				else if((strstr(full_path, "(A600)") != NULL) || (strstr(full_path, "(ECS)") != NULL))
+				{
+					// Use A600
+					printf("Found '(A600)' or '(ECS)' in filename '%s'. Booting A600 with Kickstart 3.1 r40.063 rom.\n", full_path);
+					fprintf(configfile, A600);
+					path_join((char*)&kickstart, retro_system_directory, A600_ROM);
+				}
+				else if((strstr(full_path, "(A500+)") != NULL) || (strstr(full_path, "(A500PLUS)") != NULL))
 				{
 					// Use A500+
 					printf("Found '(A500+)' or '(A500PLUS)' in filename '%s'. Booting A500+ with Kickstart 2.04 r37.175.\n", full_path);
@@ -1961,20 +2512,6 @@ bool retro_load_game(const struct retro_game_info *info)
 					fprintf(configfile, A500);
 					path_join((char*)&kickstart, retro_system_directory, A500_ROM);
 				}
-				else if((strstr(full_path, "(A600)") != NULL) || (strstr(full_path, "(ECS)") != NULL))
-				{
-					// Use A600
-					printf("Found '(A600)' or '(ECS)' in filename '%s'. Booting A600 with Kickstart 3.1 r40.063 rom.\n", full_path);
-					fprintf(configfile, A600);
-					path_join((char*)&kickstart, retro_system_directory, A600_ROM);
-				}
-				else if((strstr(full_path, "(A1200)") != NULL) || (strstr(full_path, "(AGA)") != NULL))
-				{
-					// Use A1200
-					printf("Found '(A1200)' or '(AGA)' in filename '%s'. Booting A1200 with Kickstart 3.1 r40.068 rom.\n", full_path);
-					fprintf(configfile, A1200);
-					path_join((char*)&kickstart, retro_system_directory, A1200_ROM);
-				}
 				else
 				{
 					// No machine specified, we will use the configured one
@@ -1985,12 +2522,19 @@ bool retro_load_game(const struct retro_game_info *info)
 
 				// Write common config
 				fprintf(configfile, uae_config);
+
+				// If region was specified in the name of the game
+				if(strstr(full_path, "(NTSC)") != NULL)
+				{
+				   printf("Found '(NTSC)' in filename '%s'\n", full_path);
+				   fprintf(configfile, "ntsc=true\n");
+				}
+				else if(strstr(full_path, "(PAL)") != NULL)
+				{
+				   printf("Found '(PAL)' in filename '%s'\n", full_path);
+				   fprintf(configfile, "ntsc=false\n");
+				}
 				
-				// FIXME : Bug if show_leds is set to false
-				// If this parameter is set to false or not specified (default false) Rick Dangerous 2 (adf or whd version) hang when selecting level.
-				// But no impact since the parameter in RetroArch configuration overload this setting : If Leds is set to none, the led won't be drawn on screen and it works...
-				fprintf(configfile, "show_leds=true\n");
-								
 				// Verify kickstart
 				if(!file_exists(kickstart))
 				{
@@ -2013,7 +2557,7 @@ bool retro_load_game(const struct retro_game_info *info)
 						char whdload[RETRO_PATH_MAX];
 						path_join((char*)&whdload, retro_system_directory, WHDLOAD_HDF);
 
-						// Verifiy WHDLoad
+						// Verify WHDLoad
 						if(file_exists(whdload))
 							fprintf(configfile, "hardfile=read-write,32,1,2,512,%s\n", (const char*)&whdload);
 						else
@@ -2106,11 +2650,6 @@ bool retro_load_game(const struct retro_game_info *info)
                 // Write common config
                 fprintf(configfile, uae_config);
 
-                // FIXME : Bug if show_leds is set to false
-                // If this parameter is set to false or not specified (default false) Rick Dangerous 2 (adf or whd version) hang when selecting level.
-                // But no impact since the parameter in RetroArch configuration overload this setting : If Leds is set to none, the led won't be drawn on screen and it works...
-                fprintf(configfile, "show_leds=true\n");
-
 				// Verify kickstart
 				//if(!file_exists(kickstart))
 				//{
@@ -2174,12 +2713,7 @@ bool retro_load_game(const struct retro_game_info *info)
              // Write common config
              fprintf(configfile, uae_config);
 
-             // FIXME : Bug if show_leds is set to false
-             // If this parameter is set to false or not specified (default false) Rick Dangerous 2 (adf or whd version) hang when selecting level.
-             // But no impact since the parameter in RetroArch configuration overload this setting : If Leds is set to none, the led won't be drawn on screen and it works...
-             fprintf(configfile, "show_leds=true\n");
-
-             // Verifiy kickstart
+             // Verify kickstart
              if(!file_exists(kickstart))
              {
                  // Kickstart rom not found
@@ -2204,8 +2738,6 @@ bool retro_load_game(const struct retro_game_info *info)
 
   retrow = w;
   retroh = h;
-  CROP_WIDTH = retrow;
-  CROP_HEIGHT = (retroh-80);
   memset(bmp, 0, sizeof(bmp));
   Screen_SetFullUpdate();
   return true;
@@ -2213,7 +2745,6 @@ bool retro_load_game(const struct retro_game_info *info)
 
 void retro_unload_game(void)
 {
-   pauseg = 0;
 }
 
 unsigned retro_get_region(void)
@@ -2231,16 +2762,65 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info *info, 
 
 size_t retro_serialize_size(void)
 {
+   if (firstpass != 1)
+   {
+      snprintf(savestate_fname, sizeof(savestate_fname), "%s%suae_tempsave.uss", retro_save_directory, DIR_SEP_STR);
+      if (save_state(savestate_fname, "retro") >= 0)
+      {
+         FILE *file = fopen(savestate_fname, "rb");
+         if (file)
+         {
+            size_t size = 0;
+            fseek(file, 0L, SEEK_END);
+            size = ftell(file);
+            fclose(file);
+            return size;
+         }
+      }
+   }
    return 0;
 }
 
 bool retro_serialize(void *data_, size_t size)
 {
+   if (firstpass != 1)
+   {
+      snprintf(savestate_fname, sizeof(savestate_fname), "%s%suae_tempsave.uss", retro_save_directory, DIR_SEP_STR);
+      if (save_state(savestate_fname, "retro") >= 0)
+      {
+         FILE *file = fopen(savestate_fname, "rb");
+         if (file)
+         {
+            if (fread(data_, size, 1, file) == 1)
+            {
+               fclose(file);
+               return true;
+            }
+            fclose(file);
+         }
+      }
+   }
    return false;
 }
 
 bool retro_unserialize(const void *data_, size_t size)
 {
+   if (firstpass != 1)
+   {
+      snprintf(savestate_fname, sizeof(savestate_fname), "%s%suae_tempsave.uss", retro_save_directory, DIR_SEP_STR);
+      FILE *file = fopen(savestate_fname, "wb");
+      if (file)
+      {
+         if (fwrite(data_, size, 1, file) == 1)
+         {
+            fclose(file);
+            savestate_state = STATE_DORESTORE;
+            return true;
+         }
+         else
+            fclose(file);
+      }
+   }
    return false;
 }
 
